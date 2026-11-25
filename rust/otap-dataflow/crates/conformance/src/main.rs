@@ -16,6 +16,7 @@ mod graph;
 mod live;
 mod plan;
 mod reconfiguration;
+mod released;
 mod tls;
 // Link the production component registrations exercised by this build.
 use otel_arrow_dfe_contrib_extensions as _;
