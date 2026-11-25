@@ -1,0 +1,12 @@
+change_type: bug_fix
+
+component: pipeline
+
+note: "OTLP gRPC exporter: shutdown no longer waits past its deadline for exports stuck on an unreachable endpoint; they are NACKed as retryable."
+
+issues: []
+
+subtext: |
+  Before, a pipeline whose backend was down could hold a reload or stop well past
+  the drain deadline (refused connections take about 2 s each on Windows), and the
+  rollout then failed with a shutdown timeout.

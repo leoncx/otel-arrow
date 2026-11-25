@@ -54,6 +54,7 @@ use std::future::poll_fn;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tonic::codec::CompressionEncoding;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
@@ -259,6 +260,10 @@ impl Exporter<OtapPdata> for OTLPExporter {
 
         let mut inflight_exports = InFlightExports::new();
         let mut pending_msg: Option<OtapPdata> = None;
+        // Cancelled when the shutdown deadline is reached: in-flight exports then
+        // complete as retryable DEADLINE_EXCEEDED failures (NACKed, not dropped)
+        // instead of holding the shutdown past its deadline.
+        let shutdown_cancel = CancellationToken::new();
 
         // Consumer-side auth adapter, if a provider is bound. It owns the auth
         // subscription, the cached `Authorization` header, and usability; the
@@ -420,8 +425,27 @@ impl Exporter<OtapPdata> for OTLPExporter {
                         nack_without_usable_auth(pdata, reason, &effect_handler, &mut self.metrics)
                             .await;
                     }
+                    // Wait for in-flight exports, but not past the deadline: an
+                    // unreachable endpoint can make each export take seconds (e.g.
+                    // a refused connection takes about 2 s on Windows), and several
+                    // exports sharing one connection fail one after another.
+                    let drain_deadline =
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+                    tokio::pin!(drain_deadline);
                     while !inflight_exports.is_empty() {
-                        if let Some(completed) = inflight_exports.next_completion().await {
+                        let completed = tokio::select! {
+                            biased;
+                            completed = inflight_exports.next_completion() => completed,
+                            () = &mut drain_deadline, if !shutdown_cancel.is_cancelled() => {
+                                otel_warn!(
+                                    "otlp.exporter.grpc.shutdown_deadline_reached",
+                                    in_flight = inflight_exports.len()
+                                );
+                                shutdown_cancel.cancel();
+                                continue;
+                            }
+                        };
+                        if let Some(completed) = completed {
                             let (client, rejected_generation) = finalize_completed_export(
                                 completed,
                                 &effect_handler,
@@ -580,7 +604,11 @@ impl Exporter<OtapPdata> for OTLPExporter {
                         SignalType::Metrics => SignalClient::Metrics(grpc_clients.take_metrics()),
                         SignalType::Traces => SignalClient::Traces(grpc_clients.take_traces()),
                     };
-                    inflight_exports.push(make_export_future(prepared, client));
+                    inflight_exports.push(make_export_future(
+                        prepared,
+                        client,
+                        shutdown_cancel.clone(),
+                    ));
                 }
                 _ => {
                     // ignore unhandled messages
@@ -975,9 +1003,28 @@ fn append_propagated_grpc_header(
 /// When `metadata` is present in the [`EncodedExport`], the outbound gRPC
 /// request carries those entries as request metadata (HTTP/2 headers).
 /// Otherwise the request is sent with an empty metadata map (zero overhead).
+/// Status of an export abandoned because the shutdown deadline was reached.
+/// `DEADLINE_EXCEEDED` is retryable, so the batch is NACKed for retry, not lost.
+fn shutdown_deadline_status() -> tonic::Status {
+    tonic::Status::deadline_exceeded("exporter shutdown deadline reached")
+}
+
+/// Runs one export RPC, or gives up when `cancel` fires (shutdown deadline).
+async fn export_or_cancel<T>(
+    export: impl Future<Output = Result<T, tonic::Status>>,
+    cancel: &CancellationToken,
+) -> Result<T, tonic::Status> {
+    tokio::select! {
+        biased;
+        result = export => result,
+        () = cancel.cancelled() => Err(shutdown_deadline_status()),
+    }
+}
+
 fn make_export_future(
     prepared: EncodedExport,
     client: SignalClient,
+    cancel: CancellationToken,
 ) -> impl Future<Output = CompletedExport> {
     let EncodedExport {
         bytes,
@@ -1002,27 +1049,33 @@ fn make_export_future(
             .run(async |attempt| {
                 attempt.set_payload_size_with(|| payload_size);
                 let result = match client {
-                    SignalClient::Logs(mut client) => match client.export(request).await {
-                        Ok(_) => Ok(SignalClient::Logs(client)),
-                        Err(status) => Err((
-                            (OtlpGrpcExporterErrorType::from_status(&status), status),
-                            SignalClient::Logs(client),
-                        )),
-                    },
-                    SignalClient::Metrics(mut client) => match client.export(request).await {
-                        Ok(_) => Ok(SignalClient::Metrics(client)),
-                        Err(status) => Err((
-                            (OtlpGrpcExporterErrorType::from_status(&status), status),
-                            SignalClient::Metrics(client),
-                        )),
-                    },
-                    SignalClient::Traces(mut client) => match client.export(request).await {
-                        Ok(_) => Ok(SignalClient::Traces(client)),
-                        Err(status) => Err((
-                            (OtlpGrpcExporterErrorType::from_status(&status), status),
-                            SignalClient::Traces(client),
-                        )),
-                    },
+                    SignalClient::Logs(mut client) => {
+                        match export_or_cancel(client.export(request), &cancel).await {
+                            Ok(_) => Ok(SignalClient::Logs(client)),
+                            Err(status) => Err((
+                                (OtlpGrpcExporterErrorType::from_status(&status), status),
+                                SignalClient::Logs(client),
+                            )),
+                        }
+                    }
+                    SignalClient::Metrics(mut client) => {
+                        match export_or_cancel(client.export(request), &cancel).await {
+                            Ok(_) => Ok(SignalClient::Metrics(client)),
+                            Err(status) => Err((
+                                (OtlpGrpcExporterErrorType::from_status(&status), status),
+                                SignalClient::Metrics(client),
+                            )),
+                        }
+                    }
+                    SignalClient::Traces(mut client) => {
+                        match export_or_cancel(client.export(request), &cancel).await {
+                            Ok(_) => Ok(SignalClient::Traces(client)),
+                            Err(status) => Err((
+                                (OtlpGrpcExporterErrorType::from_status(&status), status),
+                                SignalClient::Traces(client),
+                            )),
+                        }
+                    }
                 };
                 match result {
                     Ok(client) => Ok(client),
@@ -1949,6 +2002,107 @@ mod tests {
             receiver.try_recv().is_err(),
             "no export may reach the server while no usable token is cached"
         );
+    }
+
+    /// Scenario: an export is in flight to an endpoint that accepts the TCP
+    /// connection but never answers, and the exporter is shut down with a short
+    /// deadline.
+    /// Guarantees: shutdown does not wait for the stuck export past its deadline;
+    /// the batch is NACK'd retryably, through the same path as any failed export,
+    /// so a reload or stop is not held up by an unreachable backend and no batch is
+    /// silently dropped.
+    #[test]
+    fn shutdown_deadline_cancels_stuck_exports_and_nacks_retryably() {
+        let test_runtime = TestRuntime::new();
+        let tokio_rt = Runtime::new().unwrap();
+        let listener = tokio_rt
+            .block_on(TcpListener::bind("127.0.0.1:0"))
+            .expect("bind a silent server");
+        let grpc_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        // Accepts connections and keeps them open without ever answering.
+        _ = tokio_rt.spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(OTLP_EXPORTER_URN));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let exporter = ExporterWrapper::local(
+            OTLPExporter {
+                config: Config {
+                    grpc: GrpcClientSettings {
+                        grpc_endpoint,
+                        ..Default::default()
+                    },
+                    max_in_flight: 4,
+                    num_connections: default_num_connections(),
+                },
+                metrics: OtlpGrpcExporterMetrics::register(&pipeline_ctx, None),
+                auth_provider: None,
+            },
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![Default::default()],
+        };
+        let mut req_bytes = vec![];
+        req.encode(&mut req_bytes).unwrap();
+        let sent_bytes = Bytes::from(req_bytes);
+
+        test_runtime
+            .set_exporter(exporter)
+            .run_test(move |ctx| {
+                Box::pin(async move {
+                    let logs_pdata = OtapPdata::new_default(
+                        OtlpProtoBytes::ExportLogsRequest(sent_bytes).into(),
+                    )
+                    .test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        TestCallData::default().into(),
+                        123,
+                    );
+                    ctx.send_pdata(logs_pdata)
+                        .await
+                        .expect("Failed to send log message");
+                    // Let the export start and get stuck on the silent server.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    ctx.send_shutdown(Instant::now() + Duration::from_millis(300), "test complete")
+                        .await
+                        .expect("Failed to send Shutdown");
+                })
+            })
+            .run_validation(move |mut ctx, result| {
+                Box::pin(async move {
+                    result.unwrap();
+                    let mut pipeline_completion_rx =
+                        ctx.take_pipeline_completion_receiver().unwrap();
+                    let msg = timeout(Duration::from_secs(3), pipeline_completion_rx.recv())
+                        .await
+                        .expect("the stuck export must be abandoned at the shutdown deadline")
+                        .expect("completion channel closed");
+                    match msg {
+                        PipelineCompletionMsg::DeliverNack { nack } => {
+                            assert!(!nack.permanent, "an abandoned export must stay retryable");
+                            assert!(
+                                nack.reason.contains("shutdown deadline"),
+                                "unexpected NACK reason: {}",
+                                nack.reason
+                            );
+                        }
+                        PipelineCompletionMsg::DeliverAck { .. } => {
+                            panic!("unexpected Ack: the server never answers")
+                        }
+                    }
+                })
+            });
     }
 
     /// Scenario: the exporter's sink selects composite members and receives a
